@@ -5,6 +5,26 @@ import { Pool } from 'pg';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Simple CORS middleware (configurable via CORS_ORIGIN env var)
+// - CORS_ORIGIN can be '*' or a comma-separated list of allowed origins.
+const ALLOWED_ORIGIN = process.env.CORS_ORIGIN ?? '*';
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGIN === '*') {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin) {
+    const allowed = ALLOWED_ORIGIN.split(',').map(s => s.trim());
+    if (allowed.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // Neon requires SSL. We respect PGSSLMODE=require from .env
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
