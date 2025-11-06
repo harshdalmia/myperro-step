@@ -21,6 +21,7 @@ async function createTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS input_readings (
       id BIGSERIAL PRIMARY KEY,
+      collar_id TEXT,
       dog_name TEXT NOT NULL,
       breed TEXT,
       coat_type TEXT,
