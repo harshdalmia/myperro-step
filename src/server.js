@@ -68,6 +68,7 @@ app.get('/ingest', async (req, res) => {
   const {
     coat_type,
     breed,
+    collar_id,
     dog_name,
     height,
     weight,
@@ -98,12 +99,13 @@ app.get('/ingest', async (req, res) => {
     const insInput = await client.query(
       `
         INSERT INTO input_readings
-          (dog_name, breed, coat_type, height, weight, sex, temperature_irgun, collar_orientation)
+          (collar_id, dog_name, breed, coat_type, height, weight, sex, temperature_irgun, collar_orientation)
         VALUES
-          ($1,       $2,    $3,        $4,     $5,     $6,  $7,               $8)
-        RETURNING id, created_at;
+          ($1,        $2,      $3,    $4,        $5,     $6,     $7,  $8,               $9)
+        RETURNING id, created_at, collar_id;
       `,
       [
+        collar_id ?? null,
         dog_name,
         breed ?? null,
         coat_type ?? null,
