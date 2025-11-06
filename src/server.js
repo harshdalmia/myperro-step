@@ -153,7 +153,50 @@ app.get('/ingest', async (req, res) => {
 app.get('/', (_req, res) => {
   res.json({ ok: true, msg: 'Use /ingest?... to store data into Neon Postgres' });
 });
+app.get('/by-collar', async (req, res) => {
+  const { collar_id, limit = '100', offset = '0' } = req.query;
+  if (!collar_id) {
+    return res.status(400).json({ ok: false, error: 'collar_id is required' });
+  }
 
+  const lim = Math.max(1, Math.min(1000, parseInt(limit, 10) || 100));
+  const off = Math.max(0, parseInt(offset, 10) || 0);
+
+  try {
+    const q = await pool.query(
+      `
+        SELECT
+          ir.id                AS input_id,
+          ir.collar_id,
+          ir.dog_name,
+          ir.breed,
+          ir.coat_type,
+          ir.height,
+          ir.weight,
+          ir.sex,
+          ir.temperature_irgun,
+          ir.collar_orientation,
+          ir.created_at        AS input_created_at,
+          om.id                AS output_id,
+          om.temperature       AS temperature,
+          om.stepcount,
+          om.caloriecount,
+          om.created_at        AS output_created_at
+        FROM input_readings ir
+        LEFT JOIN output_metrics om ON om.input_id = ir.id
+        WHERE ir.collar_id = $1
+        ORDER BY ir.created_at DESC, om.created_at DESC NULLS LAST
+        LIMIT $2 OFFSET $3
+      `,
+      [collar_id, lim, off]
+    );
+
+    res.json({ ok: true, count: q.rowCount, data: q.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 (async () => {
   try {
     await createTables();
