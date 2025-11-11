@@ -217,6 +217,48 @@ app.get('/by-collar', async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// Short routes /1 .. /6 that return the latest record for that collar_id
+// Example: GET /1  -> returns latest rows for collar_id = '1'
+app.get('/:num([1-6])', async (req, res) => {
+  const collar_id = req.params.num;
+  try {
+    const q = await pool.query(
+      `
+        SELECT
+          ir.id                AS input_id,
+          ir.collar_id,
+          ir.dog_name,
+          ir.breed,
+          ir.coat_type,
+          ir.height,
+          ir.weight,
+          ir.sex,
+          ir.temperature_irgun,
+          ir.collar_orientation,
+          ir.created_at        AS input_created_at,
+          om.id                AS output_id,
+          om.temperature       AS temperature,
+          om.stepcount,
+          om.caloriecount,
+          om.created_at        AS output_created_at
+        FROM input_readings ir
+        LEFT JOIN output_metrics om ON om.input_id = ir.id
+        WHERE ir.collar_id = $1
+        ORDER BY ir.created_at DESC, om.created_at DESC NULLS LAST
+        LIMIT 1
+      `,
+      [collar_id]
+    );
+
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: 'no data for collar_id' });
+
+    return res.json({ ok: true, data: q.rows[0] });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
 (async () => {
   try {
     await createTables();
