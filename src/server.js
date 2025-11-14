@@ -25,6 +25,9 @@ app.use((req, res, next) => {
   next();
 });
 
+// parse JSON bodies for POST /app
+app.use(express.json());
+
 // Neon requires SSL. We respect PGSSLMODE=require from .env
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -36,7 +39,7 @@ const pool = new Pool({
 //    coat_type, breed, dog_name, height, weight, sex, temperature_irgun, collar_orientation
 // 2) output_metrics  (your "output schema")
 //    temperature, stepcount, caloriecount
-//    linked to input_readings via input_id
+//    linked to input_readings via collar_id
 async function createTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS input_readings (
@@ -57,10 +60,17 @@ async function createTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS output_metrics (
       id BIGSERIAL PRIMARY KEY,
-      input_id BIGINT NOT NULL REFERENCES input_readings(id) ON DELETE CASCADE,
+      collar_id TEXT,
       temperature NUMERIC,
       stepcount BIGINT,
       caloriecount NUMERIC,
+      accel_x NUMERIC,
+      accel_y NUMERIC,
+      accel_z NUMERIC,
+      gyro_x NUMERIC,
+      gyro_y NUMERIC,
+      gyro_z NUMERIC,
+      npl_time TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
@@ -73,94 +83,55 @@ function toNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+
 /**
- * Single GET endpoint to ingest & persist.
- * Call like:
- * /ingest?dog_name=Muffin&breed=Indie&coat_type=short&height=45&weight=18&sex=male
- *        &temperature_irgun=38.6&collar_orientation=top
- *        &temperature=38.2&stepcount=1234&caloriecount=56
- *
- * This will:
- * 1) insert into input_readings
- * 2) insert into output_metrics (linked via input_id) if any output fields present
+ * New POST /app endpoint to accept JSON body for input_readings
+ * Expected JSON body shape (example):
+ * {
+ *   "collar_id":"C123",
+ *   "dog_name":"Muffin",
+ *   "breed":"Indie",
+ *   "coat_type":"single",
+ *   "height":45,
+ *   "weight":18,
+ *   "sex":"male",
+ *   "temperature_irgun":38.6,
+ *   "collar_orientation":"top"
+ * }
  */
-app.get('/ingest', async (req, res) => {
+app.post('/app', async (req, res) => {
   const {
-    coat_type,
-    breed,
     collar_id,
     dog_name,
+    breed,
+    coat_type,
     height,
     weight,
     sex,
     temperature_irgun,
-    collar_orientation,
-    temperature,
-    stepcount,
-    caloriecount
-  } = req.query;
+    collar_orientation
+  } = req.body || {};
 
-  if (!dog_name) {
-    return res.status(400).json({ ok: false, error: 'dog_name is required' });
-  }
+  if (!dog_name) return res.status(400).json({ ok: false, error: 'dog_name is required' });
 
   const heightN = toNum(height);
   const weightN = toNum(weight);
   const tempIrN = toNum(temperature_irgun);
-  const tempOutN = toNum(temperature);
-  const stepN    = toNum(stepcount);
-  const kcalN    = toNum(caloriecount);
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // insert input row
-    const insInput = await client.query(
+    const ins = await client.query(
       `
         INSERT INTO input_readings
           (collar_id, dog_name, breed, coat_type, height, weight, sex, temperature_irgun, collar_orientation)
-        VALUES
-          ($1,        $2,      $3,    $4,        $5,     $6,     $7,  $8,               $9)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         RETURNING id, created_at, collar_id;
       `,
-      [
-        collar_id ?? null,
-        dog_name,
-        breed ?? null,
-        coat_type ?? null,
-        heightN,
-        weightN,
-        sex ?? null,
-        tempIrN,
-        collar_orientation ?? null
-      ]
+      [collar_id ?? null, dog_name, breed ?? null, coat_type ?? null, heightN, weightN, sex ?? null, tempIrN, collar_orientation ?? null]
     );
-    const inputId = insInput.rows[0].id;
-
-    // optional output insertion
-    let outputRow = null;
-    if (tempOutN !== null || stepN !== null || kcalN !== null) {
-      const insOutput = await client.query(
-        `
-          INSERT INTO output_metrics (input_id, temperature, stepcount, caloriecount)
-          VALUES ($1, $2, $3, $4)
-          RETURNING id, created_at;
-        `,
-        [inputId, tempOutN, stepN, kcalN]
-      );
-      outputRow = insOutput.rows[0];
-    }
-
     await client.query('COMMIT');
-
-    res.json({
-      ok: true,
-      inserted: {
-        input_readings: { id: inputId, ...insInput.rows[0] },
-        output_metrics: outputRow
-      }
-    });
+    res.json({ ok: true, inserted: ins.rows[0] });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error(e);
@@ -171,47 +142,68 @@ app.get('/ingest', async (req, res) => {
 });
 
 app.get('/', (_req, res) => {
-  res.json({ ok: true, msg: 'Use /ingest?... to store data into Neon Postgres' });
+  res.json({ ok: true, msg: 'Use POST /app to store input_readings and GET /collar to query or send output metrics' });
 });
-app.get('/by-collar', async (req, res) => {
-  const { collar_id, limit = '100', offset = '0' } = req.query;
-  if (!collar_id) {
-    return res.status(400).json({ ok: false, error: 'collar_id is required' });
-  }
+
+app.get('/collar', async (req, res) => {
+  const {
+    collar_id,
+    limit = '100',
+    offset = '0',
+    temperature,
+    stepcount,
+    caloriecount,
+    accel_x,
+    accel_y,
+    accel_z,
+    gyro_x,
+    gyro_y,
+    gyro_z,
+    npl_time
+  } = req.query;
+
+  if (!collar_id) return res.status(400).json({ ok: false, error: 'collar_id is required' });
+
+  // If any output metric query param is present, treat this GET as an ingest of output data
+  const hasOutputData = (
+    temperature !== undefined || stepcount !== undefined || caloriecount !== undefined ||
+    accel_x !== undefined || accel_y !== undefined || accel_z !== undefined ||
+    gyro_x !== undefined || gyro_y !== undefined || gyro_z !== undefined ||
+    npl_time !== undefined
+  );
 
   const lim = Math.max(1, Math.min(1000, parseInt(limit, 10) || 100));
   const off = Math.max(0, parseInt(offset, 10) || 0);
 
   try {
-    const q = await pool.query(
-      `
-        SELECT
-          ir.id                AS input_id,
-          ir.collar_id,
-          ir.dog_name,
-          ir.breed,
-          ir.coat_type,
-          ir.height,
-          ir.weight,
-          ir.sex,
-          ir.temperature_irgun,
-          ir.collar_orientation,
-          ir.created_at        AS input_created_at,
-          om.id                AS output_id,
-          om.temperature       AS temperature,
-          om.stepcount,
-          om.caloriecount,
-          om.created_at        AS output_created_at
-        FROM input_readings ir
-        LEFT JOIN output_metrics om ON om.input_id = ir.id
-        WHERE ir.collar_id = $1
-        ORDER BY ir.created_at DESC, om.created_at DESC NULLS LAST
-        LIMIT $2 OFFSET $3
-      `,
-      [collar_id, lim, off]
-    );
+    if (hasOutputData) {
+      // Insert output_metrics directly with collar_id (no need to lookup input_readings)
+      const tempN = toNum(temperature);
+      const stepN = toNum(stepcount);
+      const kcalN = toNum(caloriecount);
+      const ax = toNum(accel_x);
+      const ay = toNum(accel_y);
+      const az = toNum(accel_z);
+      const gx = toNum(gyro_x);
+      const gy = toNum(gyro_y);
+      const gz = toNum(gyro_z);
+      const nplT = npl_time ? new Date(npl_time) : null;
 
-    res.json({ ok: true, count: q.rowCount, data: q.rows });
+      const ins = await pool.query(
+        `
+          INSERT INTO output_metrics (collar_id, temperature, stepcount, caloriecount, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z, npl_time)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          RETURNING id, created_at;
+        `,
+        [collar_id, tempN, stepN, kcalN, ax, ay, az, gx, gy, gz, nplT]
+      );
+
+      const outRow = ins.rows[0];
+      return res.json({ ok: true, output: { id: outRow.id, created_at: outRow.created_at, temperature: tempN, stepcount: stepN, caloriecount: kcalN, accel_x: ax, accel_y: ay, accel_z: az, gyro_x: gx, gyro_y: gy, gyro_z: gz, npl_time: nplT } });
+    }
+
+    // Enforce insert-only behavior: reject read/query requests
+    return res.status(405).json({ ok: false, error: 'GET /collar is insert-only; provide output metric query parameters to insert' });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: e.message });
@@ -226,34 +218,70 @@ app.get('/:num([1-6])', async (req, res) => {
     const q = await pool.query(
       `
         SELECT
-          ir.id                AS input_id,
-          ir.collar_id,
-          ir.dog_name,
-          ir.breed,
-          ir.coat_type,
-          ir.height,
-          ir.weight,
-          ir.sex,
-          ir.temperature_irgun,
-          ir.collar_orientation,
-          ir.created_at        AS input_created_at,
-          om.id                AS output_id,
-          om.temperature       AS temperature,
-          om.stepcount,
-          om.caloriecount,
-          om.created_at        AS output_created_at
-        FROM input_readings ir
-        LEFT JOIN output_metrics om ON om.input_id = ir.id
-        WHERE ir.collar_id = $1
-        ORDER BY ir.created_at DESC, om.created_at DESC NULLS LAST
+          id AS output_id,
+          collar_id,
+          temperature,
+          stepcount,
+          caloriecount,
+          accel_x,
+          accel_y,
+          accel_z,
+          gyro_x,
+          gyro_y,
+          gyro_z,
+          npl_time,
+          created_at AS output_created_at
+        FROM output_metrics
+        WHERE collar_id = $1
+        ORDER BY COALESCE(npl_time, created_at) DESC
         LIMIT 1
       `,
       [collar_id]
     );
 
-    if (!q.rowCount) return res.status(404).json({ ok: false, error: 'no data for collar_id' });
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: 'no output data for collar_id' });
 
-    return res.json({ ok: true, data: q.rows[0] });
+    const r = q.rows[0];
+
+    // fetch latest input_readings by collar_id (if any)
+    const inQ = await pool.query(
+      `SELECT id, collar_id, dog_name, breed, coat_type, height, weight, sex, temperature_irgun, collar_orientation, created_at
+       FROM input_readings WHERE collar_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [collar_id]
+    );
+    const inputRow = inQ.rowCount ? inQ.rows[0] : null;
+
+    const input = inputRow ? {
+      id: inputRow.id,
+      collar_id: inputRow.collar_id,
+      dog_name: inputRow.dog_name,
+      breed: inputRow.breed,
+      coat_type: inputRow.coat_type,
+      height: inputRow.height,
+      weight: inputRow.weight,
+      sex: inputRow.sex,
+      temperature_irgun: inputRow.temperature_irgun,
+      collar_orientation: inputRow.collar_orientation,
+      created_at: inputRow.created_at
+    } : null;
+
+    const output = {
+      id: r.output_id,
+      collar_id: r.collar_id,
+      temperature: r.temperature,
+      stepcount: r.stepcount,
+      caloriecount: r.caloriecount,
+      accel_x: r.accel_x,
+      accel_y: r.accel_y,
+      accel_z: r.accel_z,
+      gyro_x: r.gyro_x,
+      gyro_y: r.gyro_y,
+      gyro_z: r.gyro_z,
+      npl_time: r.npl_time,
+      created_at: r.output_created_at
+    };
+
+    return res.json({ ok: true, input, output });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ ok: false, error: e.message });
